@@ -14,13 +14,14 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("Discord Logger", "MON@H, CaptainNebulous", "2.0.28")]
+    [Info("Discord Logger", "MON@H", "2.0.30")]
     [Description("Logs events to Discord channels using webhooks")]
     public class DiscordLogger : RustPlugin
     {
         #region Variables
 
         [PluginReference] private readonly Plugin AntiSpam, BetterChatMute, CallHeli, PersonalHeli, UFilter;
+        [PluginReference] private Plugin Clans, ClansReborn;
 
         private readonly Hash<ulong, CargoShip> _cargoShips = new();
         private readonly List<ulong> _listBadCargoShips = new();
@@ -33,6 +34,8 @@ namespace Oxide.Plugins
         private readonly Dictionary<PowergridManager, int> _powerStages = new();
         private bool? _deepSeaOpen;
         private readonly Dictionary<MiningQuarry, bool> _quarryStates = new();
+        private readonly HashSet<string> _reportedClanDisbands = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, HashSet<string>> _clanInvites = new(StringComparer.OrdinalIgnoreCase);
         private Timer _quarryTimer;
 
         private EventSettings _eventSettings;
@@ -124,6 +127,7 @@ namespace Oxide.Plugins
                 }
                 _quarryTimer = timer.Every(1f, PollQuarries);
             }
+            CacheClanInvites();
             CacheOilRigsLocation();
             SubscribeHooks();
         }
@@ -774,6 +778,140 @@ namespace Oxide.Plugins
         {
             if (!_configData.ClanSettings.Enabled) return;
             string message = $":boot: <t:{DateTimeOffset.Now.ToUnixTimeSeconds()}:t> **{NativeClanPlayer(steamId)}** was kicked from clan **{NativeClanLabel(clan)}** by **{NativeClanPlayer(bySteamId)}**";
+            LogToConsole(message);
+            DiscordSendMessage(message, _configData.ClanSettings.WebhookURL);
+        }
+
+        private Plugin ExternalClans => Clans != null && Clans.IsLoaded
+            ? Clans
+            : ClansReborn != null && ClansReborn.IsLoaded ? ClansReborn : null;
+
+        private HashSet<string> ReadClanInvites(string tag)
+        {
+            var invites = new HashSet<string>(StringComparer.Ordinal);
+            var plugin = ExternalClans;
+            if (plugin == null) return invites;
+            try
+            {
+                var clan = plugin.Call("GetClan", tag) as Newtonsoft.Json.Linq.JObject;
+                var values = clan?["invited"] as Newtonsoft.Json.Linq.JArray;
+                if (values != null)
+                {
+                    foreach (var id in values)
+                    {
+                        if (id != null) invites.Add(id.ToString());
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                PrintWarning("Unable to read clan invites: " + ex.Message);
+            }
+            return invites;
+        }
+
+        private void CacheClanInvites()
+        {
+            _clanInvites.Clear();
+            var plugin = ExternalClans;
+            if (plugin == null) return;
+            try
+            {
+                var clans = plugin.Call("GetAllClans") as Newtonsoft.Json.Linq.JArray;
+                if (clans == null) return;
+                foreach (var tag in clans)
+                {
+                    if (tag != null) _clanInvites[tag.ToString()] = ReadClanInvites(tag.ToString());
+                }
+            }
+            catch (Exception ex)
+            {
+                PrintWarning("Unable to cache clan invites: " + ex.Message);
+            }
+        }
+
+        private void OnPluginLoaded(Plugin plugin)
+        {
+            if (plugin?.Name == "Clans" || plugin?.Name == "ClansReborn")
+                NextTick(CacheClanInvites);
+        }
+
+        private void OnClanCreate(string tag)
+        {
+            if (ExternalClans == null || string.IsNullOrEmpty(tag)) return;
+            _reportedClanDisbands.Remove(tag);
+            _clanInvites[tag] = ReadClanInvites(tag);
+            ReportExternalClan(LangKeys.Plugin.ClanCreated, tag);
+        }
+
+        private void OnClanDestroy(string tag)
+        {
+            if (ExternalClans == null || string.IsNullOrEmpty(tag)) return;
+            _clanInvites.Remove(tag);
+            if (!_reportedClanDisbands.Add(tag)) return;
+            timer.Once(3f, () => _reportedClanDisbands.Remove(tag));
+            ReportExternalClan(LangKeys.Plugin.ClanDisbanded, tag);
+        }
+
+        private void OnClanUpdate(string tag)
+        {
+            if (ExternalClans == null || string.IsNullOrEmpty(tag)) return;
+            var current = ReadClanInvites(tag);
+            if (_clanInvites.TryGetValue(tag, out var previous) && _configData.ClanSettings.Enabled)
+            {
+                foreach (string id in current)
+                {
+                    if (!previous.Contains(id))
+                        ReportExternalClanMember(LangKeys.Plugin.ClanInvited, tag, id);
+                }
+            }
+            _clanInvites[tag] = current;
+        }
+
+        private void ReportExternalClan(string key, string tag)
+        {
+            if (!_configData.ClanSettings.Enabled) return;
+            string message = Lang(key, null, ReplaceChars(tag));
+            LogToConsole(message);
+            DiscordSendMessage(message, _configData.ClanSettings.WebhookURL);
+        }
+
+        private void OnClanMemberJoined(string tag, ulong joining, List<ulong> members)
+        {
+            if (ExternalClans != null) ReportNativeClanMember(LangKeys.Plugin.ClanJoined, tag, joining);
+        }
+
+        private void OnClanMemberJoined(string tag, string joining, List<string> members)
+        {
+            if (ExternalClans != null) ReportExternalClanMember(LangKeys.Plugin.ClanJoined, tag, joining);
+        }
+
+        private void OnClanMemberGone(string tag, ulong leaving, List<ulong> members)
+        {
+            if (ExternalClans != null) ReportNativeClanMember(LangKeys.Plugin.ClanLeft, tag, leaving);
+        }
+
+        private void OnClanMemberGone(string tag, string leaving, List<string> members)
+        {
+            if (ExternalClans != null) ReportExternalClanMember(LangKeys.Plugin.ClanLeft, tag, leaving);
+        }
+
+        private void OnClanDisbanded(string tag, List<ulong> members)
+        {
+            OnClanDestroy(tag);
+        }
+
+        private void OnClanDisbanded(string tag, List<string> members)
+        {
+            OnClanDestroy(tag);
+        }
+
+        private void ReportExternalClanMember(string key, string tag, string id)
+        {
+            if (!_configData.ClanSettings.Enabled) return;
+            var player = covalence.Players.FindPlayerById(id);
+            string name = ReplaceChars(player?.Name ?? id);
+            string message = Lang(key, null, name, ReplaceChars(tag));
             LogToConsole(message);
             DiscordSendMessage(message, _configData.ClanSettings.WebhookURL);
         }
@@ -1463,7 +1601,7 @@ namespace Oxide.Plugins
             {
                 return;
             }
-            
+
             LogToConsole($"Player name changed from {oldName} to {newName} for ID {id}");
 
             DiscordSendMessage(Lang(LangKeys.Event.UserNameUpdated, null, ReplaceChars(oldName), ReplaceChars(newName), id), _configData.UserNameUpdateSettings.WebhookURL);
@@ -2171,16 +2309,18 @@ namespace Oxide.Plugins
             Unsubscribe(nameof(OnBetterChatMuteExpired));
             Unsubscribe(nameof(OnBetterChatTimeMuted));
             Unsubscribe(nameof(OnBetterChatUnmuted));
-            
-            Unsubscribe(nameof(OnClanDisbanded));
-                Unsubscribe(nameof(OnClanCreated));
-                Unsubscribe(nameof(OnClanMemberAdded));
-                Unsubscribe(nameof(OnClanMemberLeft));
-                Unsubscribe(nameof(OnClanMemberKicked));
 
-            
-            
-            
+            Unsubscribe(nameof(OnClanCreate));
+            Unsubscribe(nameof(OnClanDestroy));
+            Unsubscribe(nameof(OnClanUpdate));
+            Unsubscribe(nameof(OnClanMemberJoined));
+            Unsubscribe(nameof(OnClanMemberGone));
+            Unsubscribe(nameof(OnClanDisbanded));
+            Unsubscribe(nameof(OnClanCreated));
+            Unsubscribe(nameof(OnClanMemberAdded));
+            Unsubscribe(nameof(OnClanMemberLeft));
+            Unsubscribe(nameof(OnClanMemberKicked));
+
             Unsubscribe(nameof(OnDangerousEventEnded));
             Unsubscribe(nameof(OnDangerousEventStarted));
             Unsubscribe(nameof(OnDeathNotice));
@@ -2278,16 +2418,18 @@ namespace Oxide.Plugins
 
             if (_configData.ClanSettings.Enabled)
             {
-                
+
+                Subscribe(nameof(OnClanCreate));
+                Subscribe(nameof(OnClanDestroy));
+                Subscribe(nameof(OnClanUpdate));
+                Subscribe(nameof(OnClanMemberJoined));
+                Subscribe(nameof(OnClanMemberGone));
                 Subscribe(nameof(OnClanDisbanded));
                 Subscribe(nameof(OnClanCreated));
                 Subscribe(nameof(OnClanMemberAdded));
                 Subscribe(nameof(OnClanMemberLeft));
                 Subscribe(nameof(OnClanMemberKicked));
 
-                
-                
-                
             }
 
             if (_configData.DangerousTreasuresSettings.Enabled)
