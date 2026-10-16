@@ -14,14 +14,13 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("Discord Logger", "MON@H", "2.0.30")]
+    [Info("Discord Logger", "MON@H, CaptainNebulous", "2.0.30")]
     [Description("Logs events to Discord channels using webhooks")]
     public class DiscordLogger : RustPlugin
     {
         #region Variables
 
         [PluginReference] private readonly Plugin AntiSpam, BetterChatMute, CallHeli, PersonalHeli, UFilter;
-        [PluginReference] private Plugin Clans, ClansReborn;
 
         private readonly Hash<ulong, CargoShip> _cargoShips = new();
         private readonly List<ulong> _listBadCargoShips = new();
@@ -34,9 +33,10 @@ namespace Oxide.Plugins
         private readonly Dictionary<PowergridManager, int> _powerStages = new();
         private bool? _deepSeaOpen;
         private readonly Dictionary<MiningQuarry, bool> _quarryStates = new();
-        private readonly HashSet<string> _reportedClanDisbands = new(StringComparer.OrdinalIgnoreCase);
-        private readonly Dictionary<string, HashSet<string>> _clanInvites = new(StringComparer.OrdinalIgnoreCase);
         private Timer _quarryTimer;
+        private Timer _helipadTimer;
+        private readonly Dictionary<BaseEntity, bool?> _helipadStates = new();
+        private bool _helipadStateWarning;
 
         private EventSettings _eventSettings;
         private int _retryCount = 0;
@@ -103,6 +103,8 @@ namespace Oxide.Plugins
         private void Unload()
         {
             _quarryTimer?.Destroy();
+            _helipadTimer?.Destroy();
+            _helipadStates.Clear();
             _quarryStates.Clear();
             Application.logMessageReceivedThreaded -= HandleLog;
         }
@@ -127,7 +129,16 @@ namespace Oxide.Plugins
                 }
                 _quarryTimer = timer.Every(1f, PollQuarries);
             }
-            CacheClanInvites();
+            if (_configData.RepairableHelipadSettings.Enabled)
+            {
+                // Existing helipads provide the baseline. Reloading isn't a repair event.
+                foreach (BaseNetworkable networkable in BaseNetworkable.serverEntities)
+                {
+                    BaseEntity pad = networkable as BaseEntity;
+                    if (IsRepairableHelipad(pad)) _helipadStates[pad] = ReadHelipadRepaired(pad);
+                }
+                _helipadTimer = timer.Every(3f, CheckHelipads);
+            }
             CacheOilRigsLocation();
             SubscribeHooks();
         }
@@ -172,6 +183,9 @@ namespace Oxide.Plugins
 
             [JsonProperty(PropertyName = "Power Plant settings")]
             public EventSettings PowerPlantSettings = new() { Enabled = true };
+
+            [JsonProperty(PropertyName = "Repairable Helipad settings")]
+            public EventSettings RepairableHelipadSettings = new() { Enabled = true };
 
             [JsonProperty(PropertyName = "Quarry settings")]
             public EventSettings QuarrySettings = new() { Enabled = true };
@@ -387,6 +401,7 @@ namespace Oxide.Plugins
                 ["Power Plant settings"] = _configData.PowerPlantSettings,
                 ["Excavator settings"] = _configData.ExcavatorSettings,
                 ["Quarry settings"] = _configData.QuarrySettings,
+                ["Repairable Helipad settings"] = _configData.RepairableHelipadSettings,
                 ["Small Oil Rig settings"] = _configData.SmallOilRigSettings,
                 ["Large Oil Rig settings"] = _configData.LargeOilRigSettings
             };
@@ -483,6 +498,7 @@ namespace Oxide.Plugins
                 public const string DeepSeaOpened = Base + nameof(DeepSeaOpened);
                 public const string DeepSeaClosed = Base + nameof(DeepSeaClosed);
                 public const string PowerPlantStage = Base + nameof(PowerPlantStage);
+                public const string HelipadRepaired = Base + nameof(HelipadRepaired);
                 public const string QuarryStarted = Base + nameof(QuarryStarted);
                 public const string QuarryStopped = Base + nameof(QuarryStopped);
                 public const string ExcavatorStarted = Base + nameof(ExcavatorStarted);
@@ -606,6 +622,7 @@ namespace Oxide.Plugins
                 [LangKeys.Event.DeepSeaOpened] = ":ocean: {time} Deep Sea event started",
                 [LangKeys.Event.DeepSeaClosed] = ":ocean: {time} Deep Sea event ended",
                 [LangKeys.Event.PowerPlantStage] = ":zap: {time} Power Plant changed to power stage `{1}` at `{0}`",
+                [LangKeys.Event.HelipadRepaired] = ":helicopter: {time} Air Wolf helipad repaired at `{0}`. Helicopter purchases are now available.",
                 [LangKeys.Event.QuarryStarted] = ":pick: {time} {0} started at `{1}`. Position: `{2}` Entity ID: `{3}`",
                 [LangKeys.Event.QuarryStopped] = ":pick: {time} {0} stopped at `{1}`. Position: `{2}` Entity ID: `{3}`",
                 [LangKeys.Event.ExcavatorStarted] = ":construction: {time} Excavator started at `{0}`. Mining: `{1}`",
@@ -754,12 +771,12 @@ namespace Oxide.Plugins
         }
 
         // Rust's built-in clan system (not the third-party Clans plugin).
-        private void OnClanCreated(Rust.Clans.Local.LocalClan clan, ulong leaderSteamId)
+        private void OnClanCreated(object clan, ulong leaderSteamId)
         {
             ReportNativeClan(LangKeys.Plugin.ClanCreated, clan, leaderSteamId, true);
         }
 
-        private void OnClanDisbanded(Rust.Clans.Local.LocalClan clan, ulong bySteamId)
+        private void OnClanDisbanded(object clan, ulong bySteamId)
         {
             ReportNativeClan(LangKeys.Plugin.ClanDisbanded, clan, bySteamId, true);
         }
@@ -769,149 +786,15 @@ namespace Oxide.Plugins
             ReportNativeClanMember(LangKeys.Plugin.ClanJoined, clanId.ToString(), steamId);
         }
 
-        private void OnClanMemberLeft(Rust.Clans.Local.LocalClan clan, ulong steamId)
+        private void OnClanMemberLeft(object clan, ulong steamId)
         {
             ReportNativeClanMember(LangKeys.Plugin.ClanLeft, NativeClanLabel(clan), steamId);
         }
 
-        private void OnClanMemberKicked(Rust.Clans.Local.LocalClan clan, ulong steamId, ulong bySteamId)
+        private void OnClanMemberKicked(object clan, ulong steamId, ulong bySteamId)
         {
             if (!_configData.ClanSettings.Enabled) return;
             string message = $":boot: <t:{DateTimeOffset.Now.ToUnixTimeSeconds()}:t> **{NativeClanPlayer(steamId)}** was kicked from clan **{NativeClanLabel(clan)}** by **{NativeClanPlayer(bySteamId)}**";
-            LogToConsole(message);
-            DiscordSendMessage(message, _configData.ClanSettings.WebhookURL);
-        }
-
-        private Plugin ExternalClans => Clans != null && Clans.IsLoaded
-            ? Clans
-            : ClansReborn != null && ClansReborn.IsLoaded ? ClansReborn : null;
-
-        private HashSet<string> ReadClanInvites(string tag)
-        {
-            var invites = new HashSet<string>(StringComparer.Ordinal);
-            var plugin = ExternalClans;
-            if (plugin == null) return invites;
-            try
-            {
-                var clan = plugin.Call("GetClan", tag) as Newtonsoft.Json.Linq.JObject;
-                var values = clan?["invited"] as Newtonsoft.Json.Linq.JArray;
-                if (values != null)
-                {
-                    foreach (var id in values)
-                    {
-                        if (id != null) invites.Add(id.ToString());
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                PrintWarning("Unable to read clan invites: " + ex.Message);
-            }
-            return invites;
-        }
-
-        private void CacheClanInvites()
-        {
-            _clanInvites.Clear();
-            var plugin = ExternalClans;
-            if (plugin == null) return;
-            try
-            {
-                var clans = plugin.Call("GetAllClans") as Newtonsoft.Json.Linq.JArray;
-                if (clans == null) return;
-                foreach (var tag in clans)
-                {
-                    if (tag != null) _clanInvites[tag.ToString()] = ReadClanInvites(tag.ToString());
-                }
-            }
-            catch (Exception ex)
-            {
-                PrintWarning("Unable to cache clan invites: " + ex.Message);
-            }
-        }
-
-        private void OnPluginLoaded(Plugin plugin)
-        {
-            if (plugin?.Name == "Clans" || plugin?.Name == "ClansReborn")
-                NextTick(CacheClanInvites);
-        }
-
-        private void OnClanCreate(string tag)
-        {
-            if (ExternalClans == null || string.IsNullOrEmpty(tag)) return;
-            _reportedClanDisbands.Remove(tag);
-            _clanInvites[tag] = ReadClanInvites(tag);
-            ReportExternalClan(LangKeys.Plugin.ClanCreated, tag);
-        }
-
-        private void OnClanDestroy(string tag)
-        {
-            if (ExternalClans == null || string.IsNullOrEmpty(tag)) return;
-            _clanInvites.Remove(tag);
-            if (!_reportedClanDisbands.Add(tag)) return;
-            timer.Once(3f, () => _reportedClanDisbands.Remove(tag));
-            ReportExternalClan(LangKeys.Plugin.ClanDisbanded, tag);
-        }
-
-        private void OnClanUpdate(string tag)
-        {
-            if (ExternalClans == null || string.IsNullOrEmpty(tag)) return;
-            var current = ReadClanInvites(tag);
-            if (_clanInvites.TryGetValue(tag, out var previous) && _configData.ClanSettings.Enabled)
-            {
-                foreach (string id in current)
-                {
-                    if (!previous.Contains(id))
-                        ReportExternalClanMember(LangKeys.Plugin.ClanInvited, tag, id);
-                }
-            }
-            _clanInvites[tag] = current;
-        }
-
-        private void ReportExternalClan(string key, string tag)
-        {
-            if (!_configData.ClanSettings.Enabled) return;
-            string message = Lang(key, null, ReplaceChars(tag));
-            LogToConsole(message);
-            DiscordSendMessage(message, _configData.ClanSettings.WebhookURL);
-        }
-
-        private void OnClanMemberJoined(string tag, ulong joining, List<ulong> members)
-        {
-            if (ExternalClans != null) ReportNativeClanMember(LangKeys.Plugin.ClanJoined, tag, joining);
-        }
-
-        private void OnClanMemberJoined(string tag, string joining, List<string> members)
-        {
-            if (ExternalClans != null) ReportExternalClanMember(LangKeys.Plugin.ClanJoined, tag, joining);
-        }
-
-        private void OnClanMemberGone(string tag, ulong leaving, List<ulong> members)
-        {
-            if (ExternalClans != null) ReportNativeClanMember(LangKeys.Plugin.ClanLeft, tag, leaving);
-        }
-
-        private void OnClanMemberGone(string tag, string leaving, List<string> members)
-        {
-            if (ExternalClans != null) ReportExternalClanMember(LangKeys.Plugin.ClanLeft, tag, leaving);
-        }
-
-        private void OnClanDisbanded(string tag, List<ulong> members)
-        {
-            OnClanDestroy(tag);
-        }
-
-        private void OnClanDisbanded(string tag, List<string> members)
-        {
-            OnClanDestroy(tag);
-        }
-
-        private void ReportExternalClanMember(string key, string tag, string id)
-        {
-            if (!_configData.ClanSettings.Enabled) return;
-            var player = covalence.Players.FindPlayerById(id);
-            string name = ReplaceChars(player?.Name ?? id);
-            string message = Lang(key, null, name, ReplaceChars(tag));
             LogToConsole(message);
             DiscordSendMessage(message, _configData.ClanSettings.WebhookURL);
         }
@@ -1013,6 +896,85 @@ namespace Oxide.Plugins
             _powerStages[manager] = stage;
             SendWorldEvent(_configData.PowerPlantSettings, LangKeys.Event.PowerPlantStage,
                 GetGridPosition(nearest.transform.position), stage);
+        }
+
+        // The helipad is a wipe-long objective. Only report the transition to repaired.
+        private static bool IsRepairableHelipad(BaseEntity entity)
+        {
+            return entity != null && !entity.IsDestroyed &&
+                entity.GetType().Name == "RepairableVehiclePad";
+        }
+
+        private static readonly string[] HelipadRepairedMembers =
+        {
+            "IsFullyRepaired", "IsRepaired", "IsRepairComplete", "IsComplete",
+            "FullyRepaired", "isFullyRepaired", "isRepaired", "isComplete",
+            "fullyRepaired", "repairComplete", "isRepairComplete"
+        };
+
+        private bool? ReadHelipadRepaired(BaseEntity pad)
+        {
+            Type type = pad.GetType();
+            const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            foreach (string name in HelipadRepairedMembers)
+            {
+                try
+                {
+                    PropertyInfo property = type.GetProperty(name, flags);
+                    if (property != null && property.PropertyType == typeof(bool) && property.GetIndexParameters().Length == 0)
+                        return (bool)property.GetValue(pad, null);
+
+                    FieldInfo field = type.GetField(name, flags);
+                    if (field != null && field.FieldType == typeof(bool))
+                        return (bool)field.GetValue(pad);
+
+                    MethodInfo method = type.GetMethod(name, flags, null, Type.EmptyTypes, null);
+                    if (method != null && method.ReturnType == typeof(bool))
+                        return (bool)method.Invoke(pad, null);
+                }
+                catch (Exception ex)
+                {
+                    PrintWarning($"Unable to read helipad repair state: {ex.Message}");
+                    return null;
+                }
+            }
+            if (!_helipadStateWarning)
+            {
+                _helipadStateWarning = true;
+                PrintWarning("Repairable helipad found, but its repair-state API isn't recognized on this Rust build. Helipad logging is paused to avoid inaccurate reports.");
+            }
+            return null;
+        }
+
+        private void OnEntitySpawned(RepairableVehiclePad pad)
+        {
+            if (!_configData.RepairableHelipadSettings.Enabled || pad == null) return;
+            NextTick(() =>
+            {
+                if (IsRepairableHelipad(pad)) _helipadStates[pad] = ReadHelipadRepaired(pad);
+            });
+        }
+
+        private void OnEntityKill(RepairableVehiclePad pad) => _helipadStates.Remove(pad);
+
+        private void CheckHelipads()
+        {
+            if (!_configData.RepairableHelipadSettings.Enabled) return;
+            foreach (BaseEntity pad in new List<BaseEntity>(_helipadStates.Keys))
+            {
+                if (!IsRepairableHelipad(pad))
+                {
+                    _helipadStates.Remove(pad);
+                    continue;
+                }
+                bool? repaired = ReadHelipadRepaired(pad);
+                bool? before = _helipadStates[pad];
+                if (!repaired.HasValue) continue;
+                _helipadStates[pad] = repaired;
+                if (before == false && repaired == true)
+                    SendWorldEvent(_configData.RepairableHelipadSettings, LangKeys.Event.HelipadRepaired,
+                        GetGridPosition(pad.transform.position));
+            }
         }
 
         private void OnEntitySpawned(MiningQuarry quarry)
@@ -1601,7 +1563,7 @@ namespace Oxide.Plugins
             {
                 return;
             }
-
+            
             LogToConsole($"Player name changed from {oldName} to {newName} for ID {id}");
 
             DiscordSendMessage(Lang(LangKeys.Event.UserNameUpdated, null, ReplaceChars(oldName), ReplaceChars(newName), id), _configData.UserNameUpdateSettings.WebhookURL);
@@ -2309,18 +2271,16 @@ namespace Oxide.Plugins
             Unsubscribe(nameof(OnBetterChatMuteExpired));
             Unsubscribe(nameof(OnBetterChatTimeMuted));
             Unsubscribe(nameof(OnBetterChatUnmuted));
-
-            Unsubscribe(nameof(OnClanCreate));
-            Unsubscribe(nameof(OnClanDestroy));
-            Unsubscribe(nameof(OnClanUpdate));
-            Unsubscribe(nameof(OnClanMemberJoined));
-            Unsubscribe(nameof(OnClanMemberGone));
+            
             Unsubscribe(nameof(OnClanDisbanded));
-            Unsubscribe(nameof(OnClanCreated));
-            Unsubscribe(nameof(OnClanMemberAdded));
-            Unsubscribe(nameof(OnClanMemberLeft));
-            Unsubscribe(nameof(OnClanMemberKicked));
+                Unsubscribe(nameof(OnClanCreated));
+                Unsubscribe(nameof(OnClanMemberAdded));
+                Unsubscribe(nameof(OnClanMemberLeft));
+                Unsubscribe(nameof(OnClanMemberKicked));
 
+            
+            
+            
             Unsubscribe(nameof(OnDangerousEventEnded));
             Unsubscribe(nameof(OnDangerousEventStarted));
             Unsubscribe(nameof(OnDeathNotice));
@@ -2374,6 +2334,11 @@ namespace Oxide.Plugins
 
         public void SubscribeHooks()
         {
+            if (_configData.RepairableHelipadSettings.Enabled)
+            {
+                Subscribe(nameof(OnEntitySpawned));
+                Subscribe(nameof(OnEntityKill));
+            }
             if (_configData.QuarrySettings.Enabled)
             {
                 Subscribe(nameof(OnQuarryToggled));
@@ -2418,18 +2383,16 @@ namespace Oxide.Plugins
 
             if (_configData.ClanSettings.Enabled)
             {
-
-                Subscribe(nameof(OnClanCreate));
-                Subscribe(nameof(OnClanDestroy));
-                Subscribe(nameof(OnClanUpdate));
-                Subscribe(nameof(OnClanMemberJoined));
-                Subscribe(nameof(OnClanMemberGone));
+                
                 Subscribe(nameof(OnClanDisbanded));
                 Subscribe(nameof(OnClanCreated));
                 Subscribe(nameof(OnClanMemberAdded));
                 Subscribe(nameof(OnClanMemberLeft));
                 Subscribe(nameof(OnClanMemberKicked));
 
+                
+                
+                
             }
 
             if (_configData.DangerousTreasuresSettings.Enabled)
